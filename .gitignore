@@ -1,0 +1,9 @@
+/target/
+/boot-input/
+/build/
+/initial-analysis/
+/initrd.img
+__pycache__/
+*~
+.#*
+\#*\#

@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""Build a reproducible newc initramfs without root, cpio, dracut or modprobe."""
+
+import argparse
+from collections import deque
+import gzip
+import lzma
+import os
+from pathlib import Path, PurePosixPath
+import stat
+import subprocess
+import sys
+import tempfile
+
+DEFAULT_INIT = "/usr/libexec/autoinit"
+DEFAULT_CONFIG = "/usr/lib/composefs/setup-root-conf.toml"
+
+
+class SourceRoot:
+    """Resolve image paths, including absolute symlinks, within a source root."""
+
+    def __init__(self, root=None):
+        self.root = root.resolve(strict=True) if root is not None else None
+        if self.root is not None and not self.root.is_dir():
+            raise ValueError(f"not a directory: {self.root}")
+
+    def path(self, name):
+        if self.root is None:
+            return Path(name)
+
+        current = self.root
+        pending = deque(Path(name).parts)
+        links = 0
+        while pending:
+            part = pending.popleft()
+            if part in ("/", "//", "."):
+                continue
+            if part == "..":
+                if current != self.root:
+                    current = current.parent
+                continue
+
+            candidate = current / part
+            if stat.S_ISLNK(candidate.lstat().st_mode):
+                links += 1
+                if links > 40:
+                    raise ValueError(f"too many symlinks in image path: {name}")
+
+                target = Path(os.readlink(candidate))
+                if target.is_absolute():
+                    current = self.root
+                pending.extendleft(reversed(target.parts))
+            else:
+                current = candidate
+
+        return current
+
+    def files(self, directory):
+        """Enumerate files using image paths, resolving each file in the image."""
+        host_directory = self.path(directory)
+        for host_path in sorted(host_directory.rglob("*")):
+            path = directory / host_path.relative_to(host_directory)
+            if self.path(path).is_file():
+                yield path
+
+
+def module_name(path):
+    return Path(path).name.split(".ko", 1)[0].replace("-", "_")
+
+
+def decompress(path, source):
+    """Decode according to the module path, even if its symlink target differs."""
+    file = source.path(path)
+    if path.suffix == ".xz":
+        return lzma.decompress(file.read_bytes())
+    if path.suffix == ".gz":
+        return gzip.decompress(file.read_bytes())
+    if path.suffix == ".zst":
+        return subprocess.check_output(["zstd", "-q", "-d", "-c", str(file)])
+    return file.read_bytes()
+
+
+class Modules:
+    def __init__(self, directory, source=None):
+        self.directory = directory
+        self.source = source if source is not None else SourceRoot()
+        self.paths = {}
+        self.dependencies = {}
+
+        dependencies = self.source.path(directory / "modules.dep").read_text()
+        for line in dependencies.splitlines():
+            path, deps = line.split(":", 1)
+            name = module_name(path)
+            if name in self.paths:
+                raise ValueError(f"ambiguous module name: {name}")
+            self.paths[name] = path
+            self.dependencies[name] = [module_name(d) for d in deps.split()]
+
+        builtins = self.source.path(directory / "modules.builtin").read_text()
+        self.builtin = {module_name(p) for p in builtins.splitlines()}
+
+        self.soft = {}
+        try:
+            softdeps = self.source.path(directory / "modules.softdep").read_text()
+        except FileNotFoundError:
+            softdeps = ""
+
+        for line in softdeps.splitlines():
+            words = line.split()
+            if not words or words[0] != "softdep":
+                continue
+
+            pre, post, current = [], [], None
+            for word in words[2:]:
+                if word == "pre:":
+                    current = pre
+                elif word == "post:":
+                    current = post
+                elif current is not None:
+                    current.append(word.replace("-", "_"))
+
+            self.soft[words[1].replace("-", "_")] = (pre, post)
+
+    def order(self, requested):
+        result, done, active = [], set(), set()
+
+        def visit(name, required=True):
+            name = name.replace("-", "_")
+            if name in done or name in self.builtin:
+                return
+
+            if name in active:
+                raise ValueError(f"module dependency cycle at {name}")
+            if name not in self.paths:
+                if required:
+                    raise ValueError(
+                        f"module dependency {name} missing from {self.directory}"
+                    )
+
+                print(
+                    f"mkautoinitrd: warning: module {name} missing from {self.directory}; skipping",
+                    file=sys.stderr,
+                )
+                return
+
+            active.add(name)
+            pre, post = self.soft.get(name, ([], []))
+            for dependency in pre:
+                visit(dependency, required=False)
+
+            for dependency in self.dependencies[name]:
+                visit(dependency)
+
+            result.append(name)
+            active.remove(name)
+            done.add(name)
+
+            for dependency in post:
+                visit(dependency, required=False)
+
+        for name in requested:
+            visit(name, required=False)
+
+        return result
+
+
+def safe_path(name):
+    path = PurePosixPath(name)
+    if path.is_absolute() or ".." in path.parts or not path.parts:
+        raise ValueError(f"invalid archive path: {name}")
+    return str(path)
+
+
+class Archive:
+    def __init__(self):
+        self.entries = {}
+
+    def add(self, name, data=b"", mode=stat.S_IFREG | 0o644, major=0, minor=0):
+        name = safe_path(name)
+        for parent in reversed(PurePosixPath(name).parents):
+            if str(parent) != ".":
+                self.entries.setdefault(str(parent), (b"", stat.S_IFDIR | 0o755, 0, 0))
+
+        self.entries[name] = (data, mode, major, minor)
+
+    def add_file(self, source, destination):
+        # Materialize symlinks at their runtime path, without the source root.
+        source = Path(source)
+        self.add(
+            str(destination).lstrip("/"),
+            source.read_bytes(),
+            stat.S_IFREG | stat.S_IMODE(source.stat().st_mode),
+        )
+
+    def write(self, output):
+        for inode, (name, (data, mode, major, minor)) in enumerate(
+            sorted(self.entries.items()) + [("TRAILER!!!", (b"", 0, 0, 0))], 1
+        ):
+            encoded = name.encode() + b"\0"
+            fields = (
+                inode,
+                mode,
+                0,
+                0,
+                1,
+                0,
+                len(data),
+                0,
+                0,
+                major,
+                minor,
+                len(encoded),
+                0,
+            )
+            header = b"070701" + b"".join(f"{n:08x}".encode() for n in fields)
+
+            output.write(header + encoded)
+            output.write(b"\0" * (-(len(header) + len(encoded)) % 4))
+
+            output.write(data)
+            output.write(b"\0" * (-len(data) % 4))
+
+
+def include_binary(archive, path, source):
+    """Resolve libraries inside the image; only ldd runs in the chroot."""
+    command = ["ldd", path]
+    if source.root is not None:
+        command = ["chroot", str(source.root), "/usr/bin/ldd", path]
+        if os.geteuid() != 0:
+            command = ["unshare", "--user", "--map-root-user", *command]
+
+    env = {k: v for k, v in os.environ.items() if not k.startswith("LD_")}
+    env["LC_ALL"] = "C"
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+    )
+    if "=> not found" in result.stdout:
+        raise ValueError(f"missing dependencies for {path}:\n{result.stdout}")
+    if result.returncode and result.stdout.strip() not in (
+        "not a dynamic executable",
+        "statically linked",
+    ):
+        raise ValueError(f"library lookup failed for {path}:\n{result.stdout}")
+
+    archive.add_file(source.path(path), path)
+    for line in result.stdout.splitlines():
+        dependency = line.split("=>", 1)[-1].rsplit(" (", 1)[0].strip()
+        if dependency.startswith("/"):
+            archive.add_file(source.path(dependency), dependency)
+
+
+def build(args):
+    source = SourceRoot(args.root)
+    modules = Modules(args.modules_directory, source)
+    order = modules.order(args.module)
+
+    archive = Archive()
+    init = args.init
+    if init is None:
+        init = Path(DEFAULT_INIT + ("-nmstate" if args.nmstate_file else ""))
+
+    archive.add("init", init.read_bytes(), stat.S_IFREG | 0o755)
+    # composefs mount compatibility before Linux 6.15 uses /tmp for TempDir.
+    for path in ["sysroot", "proc", "sys", "dev", "run", "tmp"]:
+        archive.add(path, mode=stat.S_IFDIR | (0o1777 if path == "tmp" else 0o755))
+    archive.add("dev/console", mode=stat.S_IFCHR | 0o600, major=5, minor=1)
+
+    manifest = []
+    for name in order:
+        module = args.modules_directory / modules.paths[name]
+        target = f"usr/lib/autoinit/modules/{name}.ko"
+
+        archive.add(target, decompress(module, source))
+        manifest.append("/" + target)
+
+    archive.add("etc/autoinit.modules", ("\n".join(manifest) + "\n").encode())
+    config = args.config or Path(DEFAULT_CONFIG)
+    try:
+        config_data = source.path(config).read_bytes()
+    except FileNotFoundError:
+        if args.config is not None:
+            raise
+    else:
+        archive.add("usr/lib/composefs/setup-root-conf.toml", config_data)
+
+    if args.nmstate_file:
+        archive.add("etc/autoinit.nmstate", source.path(args.nmstate_file).read_bytes())
+
+    if args.repart:
+        definitions = Path("/usr/lib/repart.d")
+        files = list(source.files(definitions))
+        if not any(
+            path.parent == definitions and path.suffix == ".conf" for path in files
+        ):
+            raise ValueError(f"no repart definitions in {definitions}")
+
+        include_binary(archive, "/usr/bin/systemd-repart", source)
+        for path in files:
+            archive.add_file(source.path(path), path)
+
+        archive.add("etc/autoinit.repart")
+
+    if args.growfs:
+        archive.add("etc/autoinit.growfs")
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=args.output.parent, delete=False) as out:
+        temporary = Path(out.name)
+        try:
+            if args.compress == "gzip":
+                with gzip.GzipFile(
+                    filename="", fileobj=out, mode="wb", mtime=0
+                ) as compressed:
+                    archive.write(compressed)
+            else:
+                archive.write(out)
+
+            out.flush()
+            os.chmod(temporary, 0o644)
+            os.replace(temporary, args.output)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    print(f"{args.output}: {args.output.stat().st_size:,} bytes, {len(order)} modules")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--root",
+        type=Path,
+        help="read modules, configuration and repart files relative to this image root",
+    )
+    parser.add_argument(
+        "--module",
+        action="append",
+        default=[],
+        help="module to preload, with dependencies (repeatable; no modules by default)",
+    )
+
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help=f"target's setup-root configuration (default: {DEFAULT_CONFIG} if present)",
+    )
+    parser.add_argument("--compress", choices=["gzip", "none"], default="gzip")
+
+    parser.add_argument(
+        "--nmstate-file",
+        type=Path,
+        help="select the nmstate init and apply this configuration after loading modules",
+    )
+    parser.add_argument(
+        "--repart",
+        action="store_true",
+        help="run systemd-repart with /usr/lib/repart.d and grow ext4 if root grows",
+    )
+    parser.add_argument(
+        "--growfs",
+        action="store_true",
+        help="grow ext4 to the current root device size on every boot",
+    )
+
+    parser.add_argument(
+        "--init",
+        type=Path,
+        help=f"host init binary, unaffected by --root (default: {DEFAULT_INIT}, or its -nmstate variant)",
+    )
+    parser.add_argument("modules_directory", type=Path)
+    parser.add_argument("output", type=Path)
+    args = parser.parse_args()
+
+    try:
+        build(args)
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        parser.exit(1, f"mkautoinitrd: {error}\n")
+
+
+if __name__ == "__main__":
+    main()
