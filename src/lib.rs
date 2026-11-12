@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
+static CONSOLE_ENABLED: AtomicBool = AtomicBool::new(true);
 
 mod block;
 mod extras;
@@ -72,7 +73,7 @@ fn mount_apis() -> Result<()> {
     }
     fs::create_dir_all("/sysroot").context("create /sysroot")?;
 
-    // Give console diagnostics to both the serial console and the kernel log.
+    // Connect standard streams for console diagnostics and the final init.
     let console = OpenOptions::new()
         .read(true)
         .write(true)
@@ -84,9 +85,11 @@ fn mount_apis() -> Result<()> {
     Ok(())
 }
 
-/// Send boot diagnostics to both the console and the kernel ring buffer.
+/// Send boot diagnostics to the kernel ring buffer and, unless quiet, the console.
 fn log(message: impl std::fmt::Display) {
-    eprintln!("autoinit: {message}");
+    if CONSOLE_ENABLED.load(Ordering::Relaxed) {
+        eprintln!("autoinit: {message}");
+    }
 
     let mut options = OpenOptions::new();
     options.write(true);
@@ -493,11 +496,12 @@ fn run(fatal_action: &mut RebootCommand) -> Result<()> {
 
     mount_apis()?;
     let start = Instant::now();
-    log("starting");
 
     let raw = fs::read_to_string("/proc/cmdline").context("read /proc/cmdline")?;
     let cmdline = Cmdline::from(raw.as_str());
     DEBUG_ENABLED.store(cmdline.find("autoinit.debug").is_some(), Ordering::Relaxed);
+    CONSOLE_ENABLED.store(cmdline.find("quiet").is_none(), Ordering::Relaxed);
+    log("starting");
     debug(format_args!(
         "verbose logging enabled; API filesystems are mounted"
     ));
