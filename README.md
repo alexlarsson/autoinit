@@ -119,7 +119,7 @@ Fatal initrd errors reboot after a three-second diagnostic delay. Set
 Add `autoinit.debug` to the kernel command line for verbose boot diagnostics,
 including module loads, root discovery and mount retries, composefs selection,
 state mount policy, networking, filesystem growth, and switch-root. Messages
-go to the console and kernel log. Normal output is unchanged without the flag.
+go to the console and kernel log. With `quiet`, messages go only to dmesg.
 
 ## License
 
